@@ -15,6 +15,57 @@ def line_intersection(p1, p2, p3, p4):
     t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
     return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
 
+def translate_points(points, translation):
+    """
+    Translates a list of 2D points by the given translation vector.
+
+    Args:
+        points (list of tuple): List of (x, y) points to be translated.
+        translation (tuple): The (xt, yt) translation vector.
+
+    Returns:
+        list of tuple: New list of translated (x, y) points.
+    """
+    xt, yt = translation
+
+    translated_points = [(x + xt, y + yt) for x, y in points]
+
+    return translated_points
+
+def rotate_points(points, angle, centre):
+    """
+    Rotates a list of 2D points by the given angle around the specified centre.
+
+    Args:
+        points (list of tuple): List of (x, y) points to be rotated.
+        angle (float): Rotation angle in degrees.
+        centre (tuple): The (xc, yc) point to rotate around.
+
+    Returns:
+        list of tuple: New list of rotated (x, y) points.
+    """
+    # Convert angle from degrees to radians
+    radians = math.radians(angle)
+    # Precompute cosine and sine of the angle
+    cos_theta = math.cos(radians)
+    sin_theta = math.sin(radians)
+    xc, yc = centre
+
+    rotated_points = []
+    for x, y in points:
+        # Translate point to origin
+        x_translated = x - xc
+        y_translated = y - yc
+        # Rotate point
+        x_rotated = x_translated * cos_theta - y_translated * sin_theta
+        y_rotated = x_translated * sin_theta + y_translated * cos_theta
+        # Translate point back
+        x_final = x_rotated + xc
+        y_final = y_rotated + yc
+        rotated_points.append((x_final, y_final))
+
+    return rotated_points
+
 def offset_polygon(polygon, offset):
     """
     Returns an offset (expanded) version of the given polygon.
@@ -121,24 +172,23 @@ def cut_offset_polygon(ncfile, polygon, config, effective_offset, pass_label="")
     perim = polygon_perimeter(adjusted_polygon)
     
     ncfile.write(f"(--- {pass_label} ---)\n")
+    current_z = ramp_start  # Start at the ramp start height for the first pass.
     for p in range(passes):
         current_depth = -min((p+1) * max_step, total_depth)  # Negative value for cutting depth.
-        drop_required = ramp_start - current_depth  # Total vertical drop needed.
-        d_ramp = drop_required / tan_angle        # Distance along path needed to achieve drop.
-        
+        drop_required = current_z - current_depth  # Total vertical drop needed for this pass.
+        d_ramp = drop_required / tan_angle  # Distance along path needed to achieve drop.
+
         # Warn if the polygon perimeter is insufficient to finish the ramp.
         if perim < d_ramp:
             ncfile.write(f"(WARNING: Polygon perimeter ({perim:.2f}mm) is shorter than ramp distance ({d_ramp:.2f}mm))\n")
             
         ncfile.write(f"(Pass {p+1}; target full depth = {current_depth} mm)\n")
-        # Move to safe height, then rapid position to the beginning:
-        ncfile.write(f"G00 Z{config['safe_height_mm']} (Lift tool to safe height)\n")
+        # Move to the beginning of the polygon for this pass:
         start_x, start_y = adjusted_polygon[0]
         ncfile.write(f"G00 X{start_x:.3f} Y{start_y:.3f} (Move to start point)\n")
         
         # Begin the ramp move along the polygon.
         accumulated_distance = 0.0
-        current_z = ramp_start
         ncfile.write(f"G01 Z{current_z:.3f} F{config['cutting_speed']} (Start ramp move)\n")
 
         n = len(adjusted_polygon)
@@ -151,7 +201,7 @@ def cut_offset_polygon(ncfile, polygon, config, effective_offset, pass_label="")
             # Case 1: Entire segment is within the ramp region.
             if accumulated_distance < d_ramp:
                 if new_total <= d_ramp:
-                    target_z = ramp_start - (new_total * tan_angle)
+                    target_z = current_z - (new_total * tan_angle)
                     # Do not go below current_depth.
                     if target_z < current_depth:
                         target_z = current_depth
@@ -172,17 +222,38 @@ def cut_offset_polygon(ncfile, polygon, config, effective_offset, pass_label="")
                 # Case 3: Already cutting at constant full depth.
                 ncfile.write(f"G01 X{p_end[0]:.3f} Y{p_end[1]:.3f} Z{current_depth:.3f} F{config['cutting_speed']} (Constant depth)\n")
                 accumulated_distance = new_total
-                
-        # --- Final cleanup for this pass ---
-        # The ramp move may have left a short segment at the start area that did not reach full depth.
-        # On the final pass, recut that section.
-        if p == passes - 1 and d_ramp > 0:
-            cleanup_point = get_point_along_polygon(adjusted_polygon, d_ramp)
-            ncfile.write(f"(Cleaning up ramp section)\n")
-            ncfile.write(f"G01 X{cleanup_point[0]:.3f} Y{cleanup_point[1]:.3f} Z{current_depth:.3f} F{config['cutting_speed']} (Cleanup)\n")
-        
-        # Retract the tool after each pass.
-        ncfile.write(f"G00 Z{config['safe_height_mm']} (Retract tool)\n\n")
+
+        # Update the current Z position for the next pass.
+        current_z = current_depth
+
+    # Handle the remaining ramp after the final pass
+    remaining_ramp_distance = d_ramp
+    if remaining_ramp_distance > 0:
+        ncfile.write(f"(--- Cutting remaining ramp ---)\n")
+        accumulated_distance = 0.0
+        n = len(adjusted_polygon)
+
+        for i in range(n):
+            p_start = adjusted_polygon[i]
+            p_end = adjusted_polygon[(i + 1) % n]
+            seg_length = math.hypot(p_end[0] - p_start[0], p_end[1] - p_start[1])
+            new_total = accumulated_distance + seg_length
+
+            if new_total >= remaining_ramp_distance:
+                # The remaining ramp ends within this segment
+                distance_to_ramp_end = remaining_ramp_distance - accumulated_distance
+                f = distance_to_ramp_end / seg_length
+                intermediate_x = p_start[0] + f * (p_end[0] - p_start[0])
+                intermediate_y = p_start[1] + f * (p_end[1] - p_start[1])
+                ncfile.write(f"G01 X{intermediate_x:.3f} Y{intermediate_y:.3f} Z{current_depth:.3f} F{config['cutting_speed']} (End of remaining ramp)\n")
+                break
+            else:
+                # Entire segment is part of the remaining ramp
+                ncfile.write(f"G01 X{p_end[0]:.3f} Y{p_end[1]:.3f} Z{current_depth:.3f} F{config['cutting_speed']} (Remaining ramp segment)\n")
+                accumulated_distance = new_total
+
+    # Retract the tool to safe height after all passes and ramp cleanup are complete.
+    ncfile.write(f"G00 Z{config['safe_height_mm']} (Retract tool to safe height)\n\n")
 
 # ----- Two-Pass Cutting Routine -----
 
@@ -298,8 +369,7 @@ def drill_hole(ncfile, holes, drill_diameter, config):
         # Final full circle pass at the final drill depth to complete the cut.
         ncfile.write(f"G02 I{I_value:.4f} Z{drill_depth:.4f} F{drill_speed:.1f} (Final full circle at drill depth)\n")
         
-        # Finally, move to the center of the hole and back to safe height.
-        ncfile.write(f"G01 X{Xc:.4f} Y{Yc:.4f} (Move to hole center)\n")
+        # Finally, move to the safe height.
         ncfile.write(f"G00 Z{safe_height:.4f} (Move to safe height)\n\n")
 
 # ----- Example Usage -----
@@ -321,26 +391,75 @@ if __name__ == "__main__":
     }
     
     # Define the desired part polygon (final dimensions)
-    part_polygon = [
-        (0, 0), (0, 117), (70.5, 117), (100.5, 151), (112.5, 151),
-        (143, 117), (174, 117), (174, 265), (215, 265), (215, 0)
+    component_55_polygon1 = [
+        (0,0), (0,117), (90.5,117), (120.5,151), (132.5,151),
+        (162.5,117), (194,117), (194,265), (235,265), (235,0)
     ]
-    drill_holes_4mm = [(6,32), (6,49), (6,79), (6,109),
-                    (35,32), (35,109),
-                    (67,32), (67,44), (67,71), (67,97), (67,109), 
-                    (93,32), (93,109),
-                    (122,32), (122,109),
-                    (106.5,145),
-                    (151,32), (151,109),
-                    (180,32), (180,49), (180,79), (180,109), (180,139), (180,169), (180,199), (180,229), (180,259),
-                    (209,32)]
+    component_55_polygon2 = [
+        (18,44), (66.2,44), (18,89.8)
+    ]
+    component_55_polygon3 = [
+        (26.8,97), (75,52.2), (75,97)
+    ]
+    component_55_polygon4 = [
+        (99,44), (176.3,44), (99,90)
+    ]
+    component_55_polygon5 = [
+        (110.7,97), (188,51), (188,97)
+    ]
+    component_55_drillholes_4mm = [
+        (6,32), (6,49), (6,79), (6,109),
+        (26,32), (26,109),
+        (55,32), (55,109),
+        (87,32), (87,44), (87,71), (87,97), (87,109),
+        (113,32), (113,109),
+        (126.5,145),
+        (142,32), (142,109),
+        (171,32), (171,109),
+        (200,32), (200,49), (200,79), (200,109), (200,139), (200,169), (200,199), (200,229), (200,259),
+        (229,32)
+    ]
+    component_55_drillholes_16mm = [
+        (16,16), (40.5,16), (69.5,16), (98.5,16), (127.5,16), (156.5,16), (185.5,16), (214.5,16)
+    ]
+    component_55_drillholes_20mm = [
+        (217,64), (217,94), (217,124), (217,154), (217,184), (217,214), (217,244)
+    ]
 
+    component_55_polygon1_2 = rotate_points(component_55_polygon1, 180, (0,0))
+    component_55_polygon1_2 = translate_points(component_55_polygon1_2, (180, 280))
+    component_55_polygon2_2 = rotate_points(component_55_polygon2, 180, (0,0))
+    component_55_polygon2_2 = translate_points(component_55_polygon2_2, (180, 280))
+    component_55_polygon3_2 = rotate_points(component_55_polygon3, 180, (0,0))
+    component_55_polygon3_2 = translate_points(component_55_polygon3_2, (180, 280))
+    component_55_polygon4_2 = rotate_points(component_55_polygon4, 180, (0,0))
+    component_55_polygon4_2 = translate_points(component_55_polygon4_2, (180, 280))
+    component_55_polygon5_2 = rotate_points(component_55_polygon5, 180, (0,0))
+    component_55_polygon5_2 = translate_points(component_55_polygon5_2, (180, 280))
+    component_55_drillholes_4mm_2 = rotate_points(component_55_drillholes_4mm, 180, (0,0))
+    component_55_drillholes_4mm_2 = translate_points(component_55_drillholes_4mm_2, (180, 280))
+    component_55_drillholes_16mm_2 = rotate_points(component_55_drillholes_16mm, 180, (0,0))
+    component_55_drillholes_16mm_2 = translate_points(component_55_drillholes_16mm_2, (180, 280))
+    component_55_drillholes_20mm_2 = rotate_points(component_55_drillholes_20mm, 180, (0,0))
+    component_55_drillholes_20mm_2 = translate_points(component_55_drillholes_20mm_2, (180, 280))
     
     with open("part.nc", "w") as ncfile:
         # (The setup g-code would be written before calling these functions.)
-        reversed_polygon = part_polygon[::-1]
-        cut_two_pass_polygons(ncfile, part_polygon, machine_config)
-        drill_hole(ncfile, drill_holes_4mm, 4.0, machine_config)
-
+        cut_two_pass_polygons(ncfile, component_55_polygon1, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon2, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon3, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon4, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon5, machine_config)
+        drill_hole(ncfile, component_55_drillholes_4mm, 4.0, machine_config)
+        drill_hole(ncfile, component_55_drillholes_16mm, 16.0, machine_config)
+        drill_hole(ncfile, component_55_drillholes_20mm, 20.0, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon1_2, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon2_2, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon3_2, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon4_2, machine_config)
+        cut_two_pass_polygons(ncfile, component_55_polygon5_2, machine_config)
+        drill_hole(ncfile, component_55_drillholes_4mm_2, 4.0, machine_config)
+        drill_hole(ncfile, component_55_drillholes_16mm_2, 16.0, machine_config)
+        drill_hole(ncfile, component_55_drillholes_20mm_2, 20.0, machine_config)
 
 
